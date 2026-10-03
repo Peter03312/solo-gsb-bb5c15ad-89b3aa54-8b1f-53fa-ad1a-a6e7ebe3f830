@@ -13,6 +13,7 @@ const movementPlan = require('../movement-plan');
 const pause = require('../pause');
 const checkpoint = require('../checkpoint');
 const routeChangeset = require('../route-changeset');
+const exam = require('../exam');
 const { withYard } = require('../db');
 
 const router = express.Router();
@@ -136,6 +137,30 @@ router.post('/yards/current/checkpoints/:id/rollback', wrap((req, res) => {
   const result = checkpoint.rollbackToCheckpoint(
     req.yard.id, Number(req.params.id), req.session.name);
   res.json({ ok: true, ...result });
+}));
+
+/* ----------------------------- 学员考核 ----------------------------- */
+
+// 考核列表（进行中在前；含逐项目标状态、偏差与有效用时；原站场恒为空）
+router.get('/exams', wrap((req, res) => {
+  res.json({ ok: true, exams: exam.listExams(), currentYardId: req.yard.id });
+}));
+
+// 查看单场考核（未知考核 404）
+router.get('/exams/:id', wrap((req, res) => {
+  const detail = exam.getExam(Number(req.params.id));
+  if (!detail) throw new InterlockError(404, 'EXAM_NOT_FOUND',
+    `考核 ${req.params.id} 不存在`);
+  res.json({ ok: true, exam: detail });
+}));
+
+// 开考：为当前选中的【运行中命名演练副本】指定学员与按顺序完成的进路目标，
+// 开考时刻固定目标与起始状态。原站场/已暂停副本/重复开考均拒绝。
+router.post('/exams/start', wrap((req, res) => {
+  const body = req.body || {};
+  const detail = exam.startExam(
+    req.yard.id, body.student, body.targets, req.session.name);
+  res.status(201).json({ ok: true, exam: detail });
 }));
 
 /* ----------------------------- 延时取消设置 ----------------------------- */
@@ -524,6 +549,8 @@ router.post('/reset/state', wrap((req, res) => {
     blockade.clearAllByReset();
     // 站场重置：全部未签收交接单过期（已签收单保留供复盘）
     handover.expireAllActiveByReset('state');
+    // 站场重置：进行中的考核终止并记录原因（已交卷成绩保留可查）
+    exam.terminateActiveInTxn('管理员清空推演状态（重置），进行中的考核终止；已交卷成绩保留');
   })();
   res.json({ ok: true, state: getState() });
 }));
@@ -546,6 +573,8 @@ router.post('/reset/training', wrap((req, res) => {
     blockade.clearAllByReset();
     // 站场重置：全部未签收交接单过期（已签收单保留供复盘）
     handover.expireAllActiveByReset('training');
+    // 培训重开（站场重置）：进行中的考核终止并记录原因（已交卷成绩保留）
+    exam.terminateActiveInTxn('管理员执行培训重开（站场重置），进行中的考核终止；已交卷成绩保留');
   })();
   res.json({ ok: true, state: getState() });
 }));

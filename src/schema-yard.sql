@@ -306,3 +306,79 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE INDEX IF NOT EXISTS idx_locks_instance ON route_locks(instance_id);
 CREATE INDEX IF NOT EXISTS idx_events_instance ON section_events(instance_id, seq);
 CREATE INDEX IF NOT EXISTS idx_steps_route ON route_steps(route_id, step_order);
+
+-- 命名演练副本考核（原站场不能开考；每个副本至多一场进行中的考核）：
+--  - 管理员为【运行中的命名演练副本】指定一名学员与按顺序完成的进路目标，
+--    开考时刻固定目标列表、学员与起始状态（start_state 存起始状态快照）；
+--  - 仅考核开考后归属该学员的【新进路实例】：成功开放且通过逐段走行正常解除
+--    （末段清空自动解除；人工释放、延时取消解除不算完成）；
+--  - 开放时若进路与当前待达成目标相符则挂到该目标序号，否则记为偏差
+--    （顺序外完成不补算）；等待申请自动兑现与定时走行同样计入；幂等重传不
+--    重复计数；其他人的操作不计入，联锁规则不因考核改变；
+--  - 副本暂停期间冻结有效用时（pause 时结算累计、resume 时重设起算点）；
+--  - 检查点回退或站场重置终止进行中的考核并记录原因，已交卷成绩保留；
+--  - 考核表不参与检查点快照/回退替换，创建副本时也不复制（各副本各自独立）。
+CREATE TABLE IF NOT EXISTS exams (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  student     TEXT NOT NULL,             -- 学员（值班员姓名）
+  status      TEXT NOT NULL DEFAULT 'in_progress'
+              CHECK (status IN ('in_progress','submitted','terminated')),
+  -- 开考时的进路目标序列快照（JSON 数组：[{seq,routeId,label}]，顺序即考核顺序）
+  targets_json TEXT NOT NULL,
+  started_by  TEXT,                      -- 开考管理员
+  started_at  INTEGER NOT NULL,          -- 开考时刻（epoch 毫秒）
+  -- 有效用时（毫秒）：暂停期间不计入。运行中=used_ms +(now-live_since)；
+  -- 暂停时把本段计入 used_ms 并清空 live_since；恢复/交卷/终止时重设/结算。
+  used_ms     INTEGER NOT NULL DEFAULT 0,
+  live_since  INTEGER,                   -- 当前连续运行段的起算时刻（暂停中为 NULL）
+  start_state TEXT NOT NULL DEFAULT '{}',-- 开考起始状态快照（JSON：目标与起始盘面摘要）
+  submitted_at INTEGER,                  -- 学员交卷时刻（epoch 毫秒）
+  terminated_at INTEGER,                 -- 被终止时刻（检查点回退/站场重置）
+  end_reason  TEXT,                      -- 终止原因
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+-- 同一副本至多一场进行中的考核（重复开考由该部分唯一索引兜底拒绝）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_exams_in_progress
+  ON exams(status) WHERE status='in_progress';
+
+-- 考核的逐项目标（开考时按顺序写入；仅由目标完成事件推进）
+CREATE TABLE IF NOT EXISTS exam_targets (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  exam_id     INTEGER NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+  seq         INTEGER NOT NULL,          -- 目标序号，从 1 开始（按顺序完成）
+  route_id    TEXT NOT NULL,             -- 目标进路编号（开考时快照）
+  label       TEXT,                      -- 开考时进路名称快照
+  -- pending 待达成 / done 已由匹配实例正常走行解除达成
+  status      TEXT NOT NULL DEFAULT 'pending'
+              CHECK (status IN ('pending','done')),
+  instance_id INTEGER,                   -- 达成该目标的进路实例编号（开放时挂接）
+  completed_at INTEGER,                  -- 正常解除时刻（epoch 毫秒）
+  UNIQUE (exam_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_exam_targets_exam ON exam_targets(exam_id, seq);
+
+-- 考核期间登记的学员进路实例（开考后该学员成功开放的新实例逐行登记）：
+--  - target_seq 非空：开放时与当前待达成目标相符，挂接到该目标；
+--  - target_seq 为空：顺序外/目标外进路，记为偏差（is_deviation=1），之后
+--    完成也不补算；
+--  - 正常逐段走行解除时写 completed_at，并在同一事务推进对应目标；
+--    人工释放/延时取消解除不写 completed_at，不算完成。
+-- 不设对 route_instances 的外键级联：管理员重置删除实例后考核记录仍保留溯源。
+CREATE TABLE IF NOT EXISTS exam_instances (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  exam_id     INTEGER NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+  instance_id INTEGER NOT NULL,          -- 进路实例编号
+  route_id    TEXT NOT NULL,             -- 开放时进路编号快照
+  opened_by   TEXT NOT NULL,             -- 开放人（=学员姓名）
+  source      TEXT NOT NULL DEFAULT 'manual'
+              CHECK (source IN ('manual','waiting','plan')),
+  target_seq  INTEGER,                   -- 挂接的目标序号；偏差为 NULL
+  is_deviation INTEGER NOT NULL DEFAULT 0 CHECK (is_deviation IN (0,1)),
+  completed_at INTEGER,                  -- 逐段走行正常解除时刻（epoch 毫秒）；未完成为 NULL
+  note        TEXT,                      -- 备注（偏差原因等）
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+-- 同一实例在同一场考核内只登记一次（幂等重传/重复触发不重复计数）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_exam_instance_unique
+  ON exam_instances(exam_id, instance_id);
+CREATE INDEX IF NOT EXISTS idx_exam_instances_exam ON exam_instances(exam_id, id);

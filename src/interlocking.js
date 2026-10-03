@@ -195,9 +195,10 @@ function openRoute(routeId, switchPositions, clientName) {
  *
  * 直接开放时由 openRoute 包一层顶层事务；等待申请兑现扫描时，本函数在
  * 扫描事务内的 SAVEPOINT 中执行，失败只回滚本次兑现尝试。
+ * @param {string} source 'manual' 直接开放 / 'waiting' 等待申请自动兑现
  * @returns {number} 新建立的进路实例编号
  */
-function openRouteInTxn(routeId, switchPositions, clientName) {
+function openRouteInTxn(routeId, switchPositions, clientName, source = 'manual') {
   const db = getDb();
 
   const route = getRoute(routeId);
@@ -288,6 +289,10 @@ function openRouteInTxn(routeId, switchPositions, clientName) {
     }
     throw e;
   }
+
+  // 考核登记（同一事务内）：仅当本副本有进行中考核且开放人为指定学员时，
+  // 登记该开考后新实例并判定顺序挂接/偏差；无考核时为空操作。随主事务提交。
+  require('./exam').recordOpenInTxn(instanceId, routeId, clientName, source);
 
   return instanceId;
 }
@@ -489,7 +494,10 @@ function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName,
        WHERE id=?`
     ).run(instanceId);
     db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(instanceId);
-    return { idempotent: false, instanceId, seq, sectionId, action, routeReleased: true };
+    // 考核计数（同一事务内）：逐段走行【正常解除】才推进当前目标；人工释放/
+    // 延时取消解除不经过此路径；幂等重传在上面的历史事件分支已提前返回。
+    const examResult = require('./exam').recordWalkthroughReleaseInTxn(instanceId);
+    return { idempotent: false, instanceId, seq, sectionId, action, routeReleased: true, examResult };
   }
 
   db.prepare(
@@ -610,7 +618,9 @@ function getState() {
     handovers: require('./handover').listHandovers(),
     // 定时走行计划：全部计划（值班台查看/终止）+ 活动计划按实例索引
     movementPlans: require('./movement-plan').listPlans(),
-    activeMovementPlans: require('./movement-plan').activeByInstance()
+    activeMovementPlans: require('./movement-plan').activeByInstance(),
+    // 学员考核：当前进行中考核 + 最近若干场（管理台/值班台显示进度与结果）
+    exams: require('./exam').getStateSummary()
   };
 }
 

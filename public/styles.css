@@ -359,3 +359,6 @@ table.grid th { background: #f5f7fa; font-weight: 600; }
 
 .kv { font-size: 12.5px; line-height: 1.9; }
 .kv b { font-weight: 600; }
+
+/* 学员考核面板 */
+.exam-panel .instance-card { background: #fbfaff; border-color: #ddd2f5; }

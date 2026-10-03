@@ -66,6 +66,12 @@ function startCountdown() {
       const ms = to - effectiveNow();
       node.textContent = ms <= 0 ? '到期处理中…' : formatRemaining(ms);
     });
+    // 考核有效用时：进行中按本地经过时间递增（暂停副本不挂 renderedAt，不递增）
+    document.querySelectorAll('[data-exam-elapsed]').forEach((node) => {
+      const base = Number(node.getAttribute('data-used-ms') || 0);
+      const at = node.getAttribute('data-rendered-at');
+      node.textContent = formatElapsed(at ? base + (Date.now() - Number(at)) : base);
+    });
   }, 500);
 }
 
@@ -229,6 +235,8 @@ function renderSide() {
   side.innerHTML = '';
   if (!STATE) return;
 
+  // 学员考核面板仅命名演练副本显示（原站场不能开考）
+  if (STATE.yard && !STATE.yard.isOriginal) side.appendChild(renderExamPanel());
   side.appendChild(renderRoutePicker());
   if (currentRouteObj()) {
     side.appendChild(renderRouteOps());
@@ -241,6 +249,119 @@ function renderSide() {
   side.appendChild(renderSwitchPanel());
   side.appendChild(renderSectionPanel());
   side.appendChild(renderInstances());
+}
+
+/* ------------------------------- 学员考核 ------------------------------- */
+
+const EXAM_STATUS_TEXT = { in_progress: '进行中', submitted: '已交卷', terminated: '已终止' };
+const EXAM_STATUS_CLS = { in_progress: 'green', submitted: 'lock', terminated: 'unknown' };
+
+function formatElapsed(ms) {
+  const total = Math.max(0, Math.round(Number(ms) / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
+function examState() {
+  return (STATE && STATE.exams) || { current: null, recent: [] };
+}
+
+function renderExamPanel() {
+  const box = html('div', { class: 'exam-panel' });
+  const { current, recent } = examState();
+  box.appendChild(html('div', { class: 'section-title' },
+    current ? '🎓 学员考核（进行中）' : '🎓 学员考核'));
+
+  if (current) {
+    box.appendChild(renderExamCard(current, true));
+  } else {
+    const past = (recent || []).filter((e) => e.status !== 'in_progress').slice(0, 3);
+    if (!past.length) {
+      box.appendChild(html('div', { class: 'hint' },
+        '本副本当前没有进行中的考核；等待管理员在管理台指定学员与进路目标开考。'));
+      return box;
+    }
+    box.appendChild(html('div', { class: 'hint', style: 'margin-bottom:6px;' }, '本副本暂无进行中考核，最近成绩：'));
+    for (const e of past) box.appendChild(renderExamCard(e, false));
+  }
+  return box;
+}
+
+function renderExamCard(e, withSubmit) {
+  const card = html('div', { class: 'instance-card', id: 'exam-' + e.id });
+  const head = html('div', { class: 'row' });
+  head.appendChild(html('b', {}, `考核 #${e.id} · 学员 ${e.student}`));
+  head.appendChild(html('span', { class: 'muted', style: 'flex:1;' }));
+  head.appendChild(html('span', { class: `badge ${EXAM_STATUS_CLS[e.status] || 'unknown'}` },
+    EXAM_STATUS_TEXT[e.status] || e.status));
+  card.appendChild(head);
+
+  // 有效用时（暂停期间冻结；进行中每 0.5s 由倒计时定时器刷新文字）
+  const timeLine = html('div', { class: 'kv', style: 'margin-top:6px;' }, '有效用时：');
+  const paused = !!(STATE.yard && STATE.yard.paused);
+  const elapsedSpan = html('b', {
+    'data-exam-elapsed': '1',
+    'data-used-ms': String(e.effectiveElapsedMs),
+    // 进行中且副本运行时挂渲染时刻，每 0.5s 递增；暂停/已结束不挂（冻结/固定）
+    'data-rendered-at': e.status === 'in_progress' && !paused ? String(Date.now()) : ''
+  }, formatElapsed(e.effectiveElapsedMs));
+  timeLine.appendChild(elapsedSpan);
+  if (paused && e.status === 'in_progress') {
+    timeLine.appendChild(html('span', { class: 'badge amber', style: 'margin-left:6px;' }, '副本暂停 · 计时冻结'));
+  }
+  timeLine.appendChild(html('span', { class: 'muted', style: 'margin-left:8px;' },
+    `开考 ${e.startedAtText}`));
+  card.appendChild(timeLine);
+
+  // 逐项目标状态
+  const list = html('div', { style: 'margin-top:6px;display:flex;flex-direction:column;gap:3px;' });
+  e.targets.forEach((t) => {
+    const row = html('div', { class: 'row' });
+    row.appendChild(html('span', {
+      class: `badge ${t.done ? 'green' : 'unknown'}`,
+      style: 'min-width:52px;text-align:center;'
+    }, t.done ? '✓ 已达成' : '待达成'));
+    row.appendChild(html('b', { style: 'margin:0 6px;' }, `${t.seq}.`));
+    row.appendChild(html('span', { class: 'grow' }, `${t.routeId}${t.label ? ' ' + t.label : ''}`));
+    if (t.instanceId) row.appendChild(html('span', { class: 'muted' }, `实例 #${t.instanceId}`));
+    list.appendChild(row);
+  });
+  card.appendChild(list);
+
+  // 偏差
+  if (e.deviationCount) {
+    const dev = html('div', { class: 'reasons', style: 'margin-top:6px;' });
+    dev.appendChild(html('li', {}, `顺序外/目标外开放 ${e.deviationCount} 次（记为偏差，之后完成不补算）：` +
+      e.deviations.map((d) => `${d.routeId}#${d.instanceId}${d.completed ? '(已走完)' : '(未完成)'}`).join('、')));
+    card.appendChild(dev);
+  }
+
+  if (e.endReason) card.appendChild(html('div', { class: 'hint', style: 'margin-top:6px;' }, `终止原因：${e.endReason}`));
+
+  // 学员本人交卷（仅进行中且非暂停）
+  if (withSubmit && App.name() === e.student) {
+    const row = html('div', { class: 'row', style: 'margin-top:8px;' });
+    const btn = html('button', { class: 'primary small' }, '交卷（查看成绩）');
+    btn.addEventListener('click', async () => {
+      if (!confirm('确认交卷？交卷后返回逐项目标状态、偏差与有效用时，且不能重复交卷。')) return;
+      btn.disabled = true;
+      try {
+        const data = await api(`/api/exams/${e.id}/submit`, { method: 'POST' });
+        toast(`考核 #${e.id} 已交卷：达成 ${data.exam.completedTargetCount}/${data.exam.totalTargetCount}，` +
+          `偏差 ${data.exam.deviationCount}，有效用时 ${formatElapsed(data.exam.effectiveElapsedMs)}`, 'ok', 6000);
+        await load(true);
+      } catch (err) {
+        btn.disabled = false;
+        toast(err.message, 'err', 6000);
+      }
+    });
+    row.appendChild(btn);
+    card.appendChild(row);
+  }
+  return card;
 }
 
 /* ------------------------------- 临时封锁 ------------------------------- */
@@ -285,8 +406,17 @@ function renderRoutePicker() {
   box.appendChild(html('div', { class: 'section-title' }, '① 选择进路（起点 → 终点）'));
   const sel = html('select', { style: 'width:100%;' });
   sel.appendChild(html('option', { value: '' }, '— 请选择进路 —'));
+  const curExam = examState().current;
+  // 考核目标进路标注序号（仅学员本人看到考核时用于提示；其他人操作不计入考核）
+  const targetSeqOf = (routeId) => {
+    if (!curExam || curExam.student !== App.name()) return null;
+    const t = curExam.targets.find((x) => x.routeId === routeId && x.status === 'pending');
+    return t ? t.seq : null;
+  };
   for (const r of STATE.routes) {
-    const o = html('option', { value: r.id }, `${r.id} ${r.label}（${r.origin}→${r.destination}）`);
+    const seq = targetSeqOf(r.id);
+    const o = html('option', { value: r.id },
+      `${r.id} ${r.label}（${r.origin}→${r.destination}）${seq != null ? `　🎓 当前考核目标第 ${seq} 项` : ''}`);
     if (r.id === selectedRouteId) o.selected = true;
     sel.appendChild(o);
   }

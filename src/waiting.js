@@ -246,7 +246,7 @@ function sweepFulfillments(reason) {
   // SAVEPOINT 包装（在外层扫描事务内调用时自动转为 SAVEPOINT/RELEASE/ROLLBACK TO）
   const attempt = db.transaction((app) => {
     const positions = parsePositions(app.switch_positions);
-    const instanceId = inter.openRouteInTxn(app.route_id, positions, app.applicant);
+    const instanceId = inter.openRouteInTxn(app.route_id, positions, app.applicant, 'waiting');
     db.prepare(
       `UPDATE waiting_applications SET status='fulfilled', instance_id=?,
               block_reasons='[]', blocked_by=NULL, ended_at=datetime('now')

@@ -68,6 +68,17 @@
 删除进路时清理已解除历史实例、提交后按现有规则重试等待兑现，不改变区段占用、锁闭及其他
 站场。现有单条进路编辑与排路接口继续可用。
 
+管理员还可为**运行中的命名演练副本**组织**学员考核**：指定一名学员与一组**按顺序完成**的
+进路目标后开考，开考时刻固定目标序列与起始状态（原站场不能开考，同一副本只允许一场进行中
+的考核，重复开考拒绝）。系统只统计**开考后归属该学员的新进路实例**：成功开放并**逐段走行
+正常解除**时，若进路与当前待达成目标相符则推进该目标，等待申请自动兑现与定时走行同样计入；
+走行事件的**幂等重传不重复计数**，人工释放（走行未完成时本就被联锁拒绝）与**延时取消解除
+不算完成**。学员在当前目标之外成功开放的进路记为**偏差**，之后走完也不补算；其他人的操作
+一律不计入，联锁规则不因考核改变。副本**暂停期间冻结有效用时**；**检查点回退或站场重置**
+终止进行中的考核并记录原因，**已交卷成绩保留**。学员在值班台交卷（或调用交卷 API）返回
+**逐项目标状态、偏差与有效用时**，成绩刷新与服务重启后仍可查询；未知进路、非指定学员、
+已终止考核交卷与重复开考均被拒绝。管理台与值班台分别显示考核进度/成绩。
+
 ## 功能概览
 
 - **管理员页面**：在 SVG 站场图上绘制轨道区段、道岔、信号机，定义起终点进路
@@ -1132,6 +1143,139 @@ curl -s -X POST http://localhost:3000/api/admin/route-changeset/publish \
  ]}
 ```
 
+## 学员考核（命名演练副本，顺序目标）
+
+管理员可在**运行中的命名演练副本**里组织一场学员考核：在管理台"🎓 学员考核"面板（或调用
+下面的 HTTP API）填写**学员姓名**并按考核顺序逐条追加进路目标，点"开考"后目标序列与当时的
+起始盘面（区段占用、道岔位置、已开放实例）即被**固定快照**。学员随后在值班台正常排路走行，
+系统自动按下列规则记录成绩：
+
+- **只统计开考后的新进路实例、且开放人必须是指定学员**：开考前已开放的实例、其他值班员
+  开放/走行/等待兑现的实例一律不计入（也不算偏差）；联锁规则不因考核改变。
+- **推进规则**：学员成功开放进路时，若该进路与**当前待达成目标**（最靠前的未达成项）相符，
+  该实例挂接到该目标；该实例随后**逐段走行、末段清空正常解除**时目标判为达成并推进到下一项。
+  **等待申请自动兑现**（实例的开放人为申请人=学员）与**定时走行计划**到期注入走同一套代码
+  路径，同样计入。
+- **不重复/不计完成的情形**：走行事件序号**幂等重传**不重复计数；走行未完成时"人工解除"
+  本就被联锁规则拒绝；**延时取消到期解除**（未走行）不算目标完成，登记实例保持未完成。
+- **偏差**：学员在当前待达成目标之外（顺序外或目标外）成功开放的进路立即记为偏差并写明原因，
+  即使之后逐段走完也**不补算**、不推进目标；全部目标达成后再开放也记偏差。
+- **有效用时**：只累计副本处于运行状态的时间，**暂停期间冻结**（与暂停/恢复同事务结算），
+  交卷或终止时定格。
+- **终止与保留**：**检查点回退**（回退事务内置）或管理员**站场重置**（清空推演状态/培训
+  重开）会把进行中的考核置为"已终止"并记录原因；**已交卷成绩完整保留**。考核记录不参与
+  检查点快照替换、创建副本时也不复制（各副本各自独立）。
+- **交卷与查询**：学员本人交卷返回逐项目标状态、偏差清单与有效用时；之后刷新页面或重启
+  服务仍可查询。**原站场不能开考**（`400 EXAM_ORIGINAL_FORBIDDEN`），**暂停副本不能开考**、
+  暂停中不能交卷（`409 YARD_PAUSED`）；同一副本**重复开考**拒绝
+  （`409 EXAM_ALREADY_ACTIVE`）；未知进路 `404 EXAM_ROUTE_NOT_FOUND`；
+  非指定学员交卷 `403 EXAM_NOT_ASSIGNED`；已终止交卷 `409 EXAM_TERMINATED`；
+  重复交卷 `409 EXAM_ALREADY_SUBMITTED`；未知考核 `404 EXAM_NOT_FOUND`。
+
+管理台面板显示：开考表单（学员 + 有序目标）、进行中考核的实时进度（逐项 ✓/待达成、偏差、
+有效用时）与最近 5 场历史成绩；值班台面板（仅命名副本显示）显示当前考核或最近成绩、本人
+交卷按钮，并在进路下拉框中用"🎓 当前考核目标第 N 项"标注待达成进路。
+
+### 学员考核 HTTP API（含调用示例）
+
+先以管理员创建/选中副本（见"命名演练副本"一节），值班员学员账号用本人姓名登录。
+
+**1) 管理员开考**（仅运行中的命名副本；固定学员、有序目标与起始状态）
+
+```bash
+# targets 为进路编号数组，顺序即考核顺序；同一进路允许重复出现（按顺序考两次）
+curl -s -X POST http://localhost:3000/api/admin/exams/start \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"student":"张三","targets":["R1","R2","R3"]}'
+```
+
+返回 **201**：
+
+```json
+{"ok":true,"exam":{
+  "id":1,"student":"张三","status":"in_progress","inProgress":true,
+  "targets":[
+    {"seq":1,"routeId":"R1","label":"正线通过 X1→X3","status":"pending","done":false,"instanceId":null,"completedAt":null},
+    {"seq":2,"routeId":"R2","label":"正线至侧线 X1→X4","status":"pending","done":false,"instanceId":null,"completedAt":null},
+    {"seq":3,"routeId":"R3","label":"侧线至正线 X2→X3","status":"pending","done":false,"instanceId":null,"completedAt":null}],
+  "currentTarget":{"seq":1,"routeId":"R1",...},
+  "completedTargetCount":0,"totalTargetCount":3,"allTargetsDone":false,
+  "instances":[],"deviations":[],"deviationCount":0,
+  "startedBy":"管理员","startedAt":1791063000000,"startedAtText":"2026/10/3 21:00:00",
+  "submittedAt":null,"terminatedAt":null,"endReason":null,
+  "effectiveElapsedMs":0,
+  "startState":{"time":1791063000000,"sections":[...],"switches":[...],"openInstances":[]}}}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `targets[]` | 开考时固定的目标序列（含名称快照）；`status` 为 `pending`/`done`，达成后写入 `instanceId/completedAt` |
+| `instances[]` | 开考后该学员全部新实例登记：`source`（`manual` 直接开放 / `waiting` 等待自动兑现）、`targetSeq`（挂接的目标序号，偏差为 null）、`deviation`、`completed`（逐段走行正常解除） |
+| `deviations[]` | 顺序外/目标外开放记录（即使未走完也列出；走完不补算） |
+| `effectiveElapsedMs` | 有效用时（毫秒；暂停期间冻结，交卷/终止后定格） |
+| `startState` | 开考起始状态快照（区段/道岔状态与当时开放实例） |
+
+错误：原站场 `400 EXAM_ORIGINAL_FORBIDDEN`；副本暂停 `409 YARD_PAUSED`；
+已有进行中考核 `409 EXAM_ALREADY_ACTIVE`；学员姓名为空 `400 EXAM_STUDENT_INVALID`；
+目标为空/超长 `400 EXAM_TARGETS_REQUIRED`/`EXAM_TARGETS_TOO_MANY`；
+目标含未知进路 `404 EXAM_ROUTE_NOT_FOUND`；值班员调用 `403`。
+
+**2) 开考后沿用既有接口操作**（接口约定完全不变；系统在后台自动记录）
+
+```bash
+# 学员直接开放（source=manual）
+curl -s -X POST http://localhost:3000/api/routes/R1/open \
+  -H "Authorization: Bearer $STUDENT_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"switchPositions":{"SW7":"N","SW8":"N"}}'
+# 逐段走行：占用1/清空1/占用3/…，末段清空即正常解除并推进目标
+curl -s -X POST http://localhost:3000/api/instances/12/events \
+  -H "Authorization: Bearer $STUDENT_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"seq":1,"sectionId":"1","action":"occupy"}'
+# 或提交等待申请（自动兑现时 source=waiting，同样计入）、定时走行计划（到期走行计入）
+```
+
+**3) 查询考核进度 / 列表**（管理台与值班台均可用；`/api/state` 也附带 `exams.current/recent`）
+
+```bash
+curl -s http://localhost:3000/api/exams        -H "Authorization: Bearer $STUDENT_TOKEN"
+curl -s http://localhost:3000/api/exams/1      -H "Authorization: Bearer $STUDENT_TOKEN"
+curl -s http://localhost:3000/api/admin/exams -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**4) 学员本人交卷**（返回逐项目标状态、偏差与有效用时；非本人/已终止/重复交卷拒绝）
+
+```bash
+curl -s -X POST http://localhost:3000/api/exams/1/submit \
+  -H "Authorization: Bearer $STUDENT_TOKEN"
+```
+
+返回 **200**（`exam` 结构同开考响应，此时 `status:"submitted"`，并含
+`submittedAt`、累计后的 `effectiveElapsedMs`、每个目标的 `done/instanceId`）：
+
+```json
+{"ok":true,"exam":{"id":1,"status":"submitted",
+  "completedTargetCount":3,"totalTargetCount":3,"allTargetsDone":true,
+  "deviationCount":1,"effectiveElapsedMs":482000, ...}}
+```
+
+错误：非指定学员 `403 EXAM_NOT_ASSIGNED`；已终止 `409 EXAM_TERMINATED`；
+重复交卷 `409 EXAM_ALREADY_SUBMITTED`；暂停中交卷 `409 YARD_PAUSED`；
+未知考核 `404 EXAM_NOT_FOUND`。
+
+**5) 暂停冻结 / 回退与重置终止（均为既有接口）**
+
+```bash
+# 暂停：有效用时停止累计（与暂停同事务）；恢复后继续
+curl -s -X POST http://localhost:3000/api/admin/yards/current/pause    -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -s -X POST http://localhost:3000/api/admin/yards/current/resume   -H "Authorization: Bearer $ADMIN_TOKEN"
+# 检查点回退：响应里 terminatedExamId 为被终止的考核编号（已交卷成绩保留）
+curl -s -X POST http://localhost:3000/api/admin/yards/current/checkpoints/1/rollback \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+# -> {"ok":true,...,"terminatedExamId":2,...}
+# 站场重置（清空推演状态 / 培训重开）同样终止进行中考核并写明原因
+curl -s -X POST http://localhost:3000/api/admin/reset/training -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
 ## 数据持久化与重置
 
 - **多站场存储**：主库（默认卷内 `/data/interlock.db`）只保存**站场注册表 `yards`
@@ -1143,12 +1287,14 @@ curl -s -X POST http://localhost:3000/api/admin/route-changeset/publish \
 - 首次启动：主库与原站场空业务库自动建好并写入示例数据；从**旧版单库升级**时，
   启动会自动把旧主库中的全部业务数据（含历史交接单）整体迁移为原站场业务库，旧表保留。
 - 每个站场的拓扑、状态、事件、进路实例、**等待申请、延时取消申请与保护时长设置、
-  定时走行计划与步骤、临时封锁申请、交接班交接单、检查点（具名快照与状态摘要）**
+  定时走行计划与步骤、临时封锁申请、交接班交接单、检查点（具名快照与状态摘要）、
+  学员考核（场次、逐项目标、实例登记与有效用时）**
   都在对应业务库中，刷新/重启后恢复。
 - 管理员页面"推演管理"提供：**清空推演状态**（删除进路实例/事件，区段恢复为未知、
   道岔回 N，保留站场图；同时撤销全部未兑现等待申请、**清除全部延时取消申请、活动定时
-  走行计划与临时封锁记录、使未签收交接单过期（已签收单保留供复盘）**）；**恢复示例初始
-  状态**（额外把示例区段置为空闲；同样撤销/清除/过期）。
+  走行计划与临时封锁记录、使未签收交接单过期（已签收单保留供复盘）、终止进行中的学员
+  考核并记录原因（已交卷成绩保留）**）；**恢复示例初始
+  状态**（额外把示例区段置为空闲；同样撤销/清除/过期/终止）。
   这些重置**只作用于当前会话所选站场**（顶栏"当前站场"）。
   "推演管理"中还可设置延时取消保护时长（正整数秒，仅影响之后新申请）。
 - 存在已开放进路期间，当前站场图（拓扑/进路定义）不可编辑，防止改变正在使用的线路。
@@ -1190,6 +1336,7 @@ curl -s -X POST http://localhost:3000/api/admin/route-changeset/publish \
 │   ├── movement-plan.js       # 定时走行计划（交替占用/清空步骤/到期沿用序号注入/前提失效停止/重启续跑）
 │   ├── blockade.js            # 临时封锁（发起/结束/待生效复核/重置清除）
 │   ├── handover.js            # 交接班交接单（生成原子快照/签收同事务比对/过期/重置与重启）
+│   ├── exam.js                # 学员考核（开考/开放登记与偏差/正常解除推进/交卷/暂停冻结用时/回退重置终止）
 │   └── routes/
 │       ├── auth.js            # 登录/登出；GET /auth/yards、PUT /auth/yard 选择当前站场
 │       ├── admin.js           # 含副本创建/暂停恢复、保护时长、封锁、进路批量变更集（预览/发布）、重置（均作用于当前站场）
@@ -1204,14 +1351,15 @@ curl -s -X POST http://localhost:3000/api/admin/route-changeset/publish \
     ├── yards-http.cjs        # 命名副本 HTTP 端到端测试（同事务复制/选择/独立运行/隔离/重启逐站场复核）
     ├── movement-plan-http.cjs# 定时走行计划 HTTP 端到端测试（校验/自动走行/人工抢先/终止/取消/重启/副本不复制）
     ├── pause-http.cjs        # 副本暂停/恢复 HTTP 端到端测试（写操作拒绝/冻结计时/退出撤销/重启/幂等）
-    └── checkpoint-http.cjs   # 检查点 HTTP 端到端测试（创建/重名/回退恢复/交接单过期/序列水位/时间冻结/重启）
-    └── route-changeset-http.cjs # 进路批量变更集 HTTP 端到端测试（预览逐条结果/受影响等待/修订标识/同事务重验/变化拒绝/开放与暂停阻断/重启标识失效）
+    ├── checkpoint-http.cjs   # 检查点 HTTP 端到端测试（创建/重名/回退恢复/交接单过期/序列水位/时间冻结/重启）
+    ├── route-changeset-http.cjs # 进路批量变更集 HTTP 端到端测试（预览逐条结果/受影响等待/修订标识/同事务重验/变化拒绝/开放与暂停阻断/重启标识失效）
+    └── exam-http.cjs         # 学员考核 HTTP 端到端测试（开考校验/重复开考/目标推进/偏差不补算/他人不计/幂等/等待兑现与定时走行计入/延时取消不算完成/暂停冻结用时/回退与重置终止/成绩保留重启/跨副本隔离）
 ```
 
 ## 测试
 
 ```bash
-npm test             # 联锁冒烟 + 等待 + 延时取消 + 临时封锁 + 交接班 + 命名副本 + 定时走行计划 + 暂停恢复 + 检查点 + 进路批量变更集端到端
+npm test             # 联锁冒烟 + 等待 + 延时取消 + 临时封锁 + 交接班 + 命名副本 + 定时走行计划 + 暂停恢复 + 检查点 + 进路批量变更集 + 学员考核端到端
 npm run smoke        # 联锁核心规则
 npm run test:waiting# 等待申请提交/撤销/顺位/自动兑现/失效/重启
 npm run test:cancel  # 延时取消申请/重复幂等/到期解除/首段占用终止/区段占用终止/重启/重置
@@ -1222,4 +1370,5 @@ npm run test:plans  # 定时走行计划提交校验/自动依序走行完成/�
 npm run test:pause  # 原站场不可暂停/写操作拒绝/定时任务冻结/退出撤销不兑现/跨重启/恢复平移与幂等
 npm run test:checkpoint # 检查点创建/重名拒绝/查看摘要/整体回退/交接单过期保留/序列水位不冲突/剩余时间冻结/已到期复核/跨重启
 npm run test:changeset # 进路批量变更集预览/逐条结果/受影响等待/修订标识变化拒绝/开放与暂停阻断/整批原子性/重启标识失效/单条编辑与排路不受影响
+npm run test:exam    # 学员考核：原站场拒考/开考固定/重复开考拒绝/顺序目标推进/偏差不补算/他人不计/幂等重传/等待兑现与定时走行计入/延时取消与人工释放不算完成/暂停冻结有效用时/回退与重置终止/已交卷成绩保留/重启可查/跨副本隔离
 ```

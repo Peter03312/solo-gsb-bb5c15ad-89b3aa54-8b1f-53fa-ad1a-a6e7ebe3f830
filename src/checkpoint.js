@@ -23,6 +23,8 @@
  *      · 检查点行本身不删除，回退后仍可再次回退到同一检查点；
  *      · 副本保持暂停（不写主库注册表），其他站场与各会话的当前站场
  *        选择不受影响；事务内任何失败整体回滚，原状态不变。
+ *  - 考核表（exams/exam_targets/exam_instances）不参与快照替换：回退使进行中
+ *    的考核终止并记录原因，已交卷成绩保留可查。
  *  - 原站场与运行中（未暂停）副本的创建/回退一律拒绝；未知检查点的
  *    查看/回退返回 404。
  */
@@ -255,7 +257,11 @@ function rollbackToCheckpoint(yardId, checkpointId, operator) {
       checkpointRollback: true
     })).changes;
 
-    return { row, shiftMs, expired };
+    // 6) 考核表不参与快照替换：进行中的考核随回退终止并记录原因（已交卷成绩保留）
+    const terminatedExamId = require('./exam').terminateActiveInTxn(
+      `管理员将副本回退到检查点 #${row.id}「${row.name}」，进行中的考核终止；已交卷成绩保留`);
+
+    return { row, shiftMs, expired, terminatedExamId };
   })();
 
   return {
@@ -264,6 +270,7 @@ function rollbackToCheckpoint(yardId, checkpointId, operator) {
     restored: safeParse(result.row.summary, {}),
     timeShiftMs: result.shiftMs,
     handoversExpired: result.expired,
+    terminatedExamId: result.terminatedExamId,
     note: '副本已整体回退到检查点并保持暂停；检查点保留可再次使用，恢复副本后按现有规则继续运行'
   };
 }

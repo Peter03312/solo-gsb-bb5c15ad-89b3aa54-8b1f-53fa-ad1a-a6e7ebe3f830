@@ -251,4 +251,27 @@ router.post('/handovers/:id/sign', wrap((req, res) => {
   });
 }));
 
+/* ------------------------------ 学员考核 ------------------------------ */
+
+// 考核列表（进行中在前；值班台显示本人/本场考核进度与历史结果）
+router.get('/exams', wrap((req, res) => {
+  const list = require('../exam').listExams();
+  res.json({ ok: true, exams: list, me: req.session.name });
+}));
+
+// 查看单场考核（逐项目标状态、偏差、有效用时；刷新/重启后仍可查询）
+router.get('/exams/:id', wrap((req, res) => {
+  const detail = require('../exam').getExam(Number(req.params.id));
+  if (!detail) throw new InterlockError(404, 'EXAM_NOT_FOUND',
+    `考核 ${req.params.id} 不存在`);
+  res.json({ ok: true, exam: detail, me: req.session.name });
+}));
+
+// 学员本人交卷：返回逐项目标状态、偏差与有效用时。
+// 非指定学员 / 已终止 / 已交卷（重复交卷）一律拒绝。
+router.post('/exams/:id/submit', wrap((req, res) => {
+  const detail = require('../exam').submitExam(Number(req.params.id), req.session.name);
+  res.json({ ok: true, exam: detail });
+}));
+
 module.exports = router;

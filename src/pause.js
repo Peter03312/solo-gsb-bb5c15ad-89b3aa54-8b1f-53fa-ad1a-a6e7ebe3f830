@@ -77,10 +77,30 @@ function pauseCurrentYard(yardId, operator) {
     }
 
     const now = Date.now();
-    db.prepare(
-      `UPDATE yards SET status='paused', paused_by=?, paused_at=?, resumed_by=NULL, resumed_at=NULL
-        WHERE id=? AND status='active'`
-    ).run(operator, now, yardId);
+    const alias = 'paused_yard_db';
+    const attach = () => db.prepare(`ATTACH DATABASE ? AS ${alias}`).run(yardDbPath(yardId));
+    const detach = () => { try { db.exec(`DETACH DATABASE ${alias}`); } catch (_) {} };
+
+    attach();
+    try {
+      db.transaction(() => {
+        db.prepare(
+          `UPDATE yards SET status='paused', paused_by=?, paused_at=?, resumed_by=NULL, resumed_at=NULL
+            WHERE id=? AND status='active'`
+        ).run(operator, now, yardId);
+        // 考核有效用时冻结：把本段运行时间计入 used_ms 并清空 live_since。
+        // 与暂停状态同一事务提交，避免暂停/用时状态不一致。
+        db.prepare(
+          `UPDATE ${alias}.exams SET used_ms = used_ms + MAX(0, ? - COALESCE(live_since, ?)),
+                  live_since = NULL
+            WHERE status='in_progress'`
+        ).run(now, now);
+      })();
+    } finally {
+      detach();
+    }
+    // ATTACH 已在业务库写入：丢弃缓存连接，确保后续以暂停语义读取新状态
+    dropYardConnection(yardId);
     return {
       yard: rowToPause(db.prepare(`SELECT * FROM yards WHERE id=?`).get(yardId)),
       changed: true,
@@ -126,6 +146,11 @@ function resumeCurrentYard(yardId, operator) {
               SET release_at = release_at + @shiftMs
             WHERE status='pending' AND release_at > @pausedAt`
         ).run({ shiftMs, pausedAt: Number(row.paused_at) });
+        // 考核恢复计时：从恢复时刻起算新的运行段（暂停段已在 pause 时计入 used_ms）
+        db.prepare(
+          `UPDATE ${alias}.exams SET live_since = @now
+            WHERE status='in_progress' AND live_since IS NULL`
+        ).run({ now });
         db.prepare(
           `UPDATE yards SET status='active', resumed_by=?, resumed_at=?,
                   paused_by=NULL, paused_at=NULL
