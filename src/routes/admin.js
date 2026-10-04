@@ -13,6 +13,7 @@ const movementPlan = require('../movement-plan');
 const pause = require('../pause');
 const checkpoint = require('../checkpoint');
 const routeChangeset = require('../route-changeset');
+const assessment = require('../assessment');
 const { withYard } = require('../db');
 
 const router = express.Router();
@@ -136,6 +137,43 @@ router.post('/yards/current/checkpoints/:id/rollback', wrap((req, res) => {
   const result = checkpoint.rollbackToCheckpoint(
     req.yard.id, Number(req.params.id), req.session.name);
   res.json({ ok: true, ...result });
+}));
+
+/* ----------------------------- 学员考核（副本） ----------------------------- */
+
+// 开考：为当前运行中的命名演练副本指定学员与按顺序完成的进路目标。
+// 原站场不能开考（400）；已暂停副本（被暂停写操作中间件以 409 YARD_PAUSED 拒绝）；
+// 同一副本只允许一场进行中考核（409 EXAM_ALREADY_ACTIVE）；未知进路 404。
+router.post('/exams', wrap((req, res) => {
+  if (req.yard.isOriginal) {
+    const err = new Error('原站场不能开考：考核只能在管理员创建的命名演练副本中进行');
+    err.status = 400;
+    err.code = 'EXAM_ORIGINAL_FORBIDDEN';
+    throw err;
+  }
+  const body = req.body || {};
+  const exam = assessment.startExam(body.student, body.routeIds, req.session.name);
+  res.status(201).json({ ok: true, exam });
+}));
+
+// 考核列表（管理台显示进度与结果）：?scope=mine 指定学员；
+// 可选 ?status=active|submitted|terminated
+router.get('/exams', wrap((req, res) => {
+  const status = ['active', 'submitted', 'terminated'].includes(req.query.status)
+    ? req.query.status : null;
+  const exams = assessment.listExams({
+    student: req.query.scope === 'all' ? undefined : (req.query.student || undefined),
+    status
+  });
+  res.json({ ok: true, exams });
+}));
+
+// 查看单场考核（逐项目标状态、偏差、有效用时；刷新/重启后仍可查询）
+router.get('/exams/:id', wrap((req, res) => {
+  const exam = assessment.getExam(Number(req.params.id));
+  if (!exam) throw new InterlockError(404, 'EXAM_NOT_FOUND',
+    `考核 ${req.params.id} 不存在（或不属于当前副本）`);
+  res.json({ ok: true, exam });
 }));
 
 /* ----------------------------- 延时取消设置 ----------------------------- */
@@ -510,6 +548,7 @@ router.post('/blockades/:id/end', wrap((req, res) => {
  */
 router.post('/reset/state', wrap((req, res) => {
   const db = getDb();
+  let terminatedExamId = null;
   db.transaction(() => {
     // 先清除待处理的延时取消申请（随后删除实例也会级联清除，这里显式清理语义清晰）
     cancellation.clearAllByReset();
@@ -524,8 +563,11 @@ router.post('/reset/state', wrap((req, res) => {
     blockade.clearAllByReset();
     // 站场重置：全部未签收交接单过期（已签收单保留供复盘）
     handover.expireAllActiveByReset('state');
+    // 站场重置终止进行中考核并记录原因（已交卷成绩保留）
+    terminatedExamId = require('../assessment').terminateActiveBySystemInTxn(
+      '管理员清空推演状态（站场重置），进行中考核终止；已交卷成绩保留');
   })();
-  res.json({ ok: true, state: getState() });
+  res.json({ ok: true, state: getState(), terminatedExamId });
 }));
 
 /**
@@ -534,6 +576,7 @@ router.post('/reset/state', wrap((req, res) => {
  */
 router.post('/reset/training', wrap((req, res) => {
   const db = getDb();
+  let terminatedExamId = null;
   db.transaction(() => {
     cancellation.clearAllByReset();
     movementPlan.clearAllByReset();
@@ -546,7 +589,10 @@ router.post('/reset/training', wrap((req, res) => {
     blockade.clearAllByReset();
     // 站场重置：全部未签收交接单过期（已签收单保留供复盘）
     handover.expireAllActiveByReset('training');
+    // 站场重置终止进行中考核并记录原因（已交卷成绩保留）
+    terminatedExamId = require('../assessment').terminateActiveBySystemInTxn(
+      '管理员培训重开（站场重置），进行中考核终止；已交卷成绩保留');
   })();
-  res.json({ ok: true, state: getState() });
+  res.json({ ok: true, state: getState(), terminatedExamId });
 }));
 module.exports = router;

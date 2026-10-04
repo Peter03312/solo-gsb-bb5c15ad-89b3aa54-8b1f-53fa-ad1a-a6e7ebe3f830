@@ -77,14 +77,30 @@ function pauseCurrentYard(yardId, operator) {
     }
 
     const now = Date.now();
-    db.prepare(
-      `UPDATE yards SET status='paused', paused_by=?, paused_at=?, resumed_by=NULL, resumed_at=NULL
-        WHERE id=? AND status='active'`
-    ).run(operator, now, yardId);
+    const alias = 'paused_yard_db';
+    const detach = () => { try { db.exec(`DETACH DATABASE ${alias}`); } catch (_) {} };
+    // 跨库事务内同时更新注册表状态与冻结进行中考核的有效用时，保证暂停时刻一致
+    db.prepare(`ATTACH DATABASE ? AS ${alias}`).run(yardDbPath(yardId));
+    let examsPaused = 0;
+    try {
+      db.transaction(() => {
+        db.prepare(
+          `UPDATE yards SET status='paused', paused_by=?, paused_at=?, resumed_by=NULL, resumed_at=NULL
+            WHERE id=? AND status='active'`
+        ).run(operator, now, yardId);
+        // 冻结进行中考核有效用时：把当前运行段并入累计、清空起点
+        examsPaused = require('./assessment')
+          .freezeOnPauseInAttachedTxn(db, alias, now);
+      })();
+    } finally {
+      detach();
+    }
+    dropYardConnection(yardId);
     return {
       yard: rowToPause(db.prepare(`SELECT * FROM yards WHERE id=?`).get(yardId)),
       changed: true,
-      alreadyPaused: false
+      alreadyPaused: false,
+      examsPaused
     };
   });
 }
@@ -131,7 +147,14 @@ function resumeCurrentYard(yardId, operator) {
                   paused_by=NULL, paused_at=NULL
             WHERE id=? AND status='paused'`
         ).run(operator, now, yardId);
-        return { movementPlanSteps: planResult.changes, cancellations: cancelResult.changes };
+        // 恢复进行中考核的有效用时：暂停期间被冻结的考核重设运行段起点。
+        const examsResumed = require('./assessment')
+          .resumeOnResumeInAttachedTxn(db, alias, now);
+        return {
+          movementPlanSteps: planResult.changes,
+          cancellations: cancelResult.changes,
+          examsResumed
+        };
       })();
       return {
         yard: rowToPause(db.prepare(`SELECT * FROM yards WHERE id=?`).get(yardId)),

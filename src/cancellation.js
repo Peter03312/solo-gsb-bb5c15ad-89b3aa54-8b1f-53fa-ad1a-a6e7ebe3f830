@@ -219,6 +219,9 @@ function processOneInTxn(row) {
       WHERE id=?`
   ).run(inst.id);
   db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(inst.id);
+  // 考核记账（同一事务）：延时取消到期解除不是逐段走行正常解除，不算完成——
+  // 占住目标的实例退回未占住（不推进目标）。
+  require('./assessment').onInstanceAbnormalReleasedInTxn(inst.id);
   db.prepare(
     `UPDATE cancellation_applications SET status='released', processed_at=?,
             end_reason='保护期满且核验通过（进路仍开放、无走行占用、沿途区段均空闲），进路已解除'

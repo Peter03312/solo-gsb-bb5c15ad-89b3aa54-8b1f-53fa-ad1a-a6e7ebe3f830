@@ -303,6 +303,74 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   snapshot    TEXT NOT NULL                -- 全量业务快照（JSON：业务表 + 序列水位 + 基准时刻）
 );
 
+-- 学员考核（仅命名演练副本可开考；原站场不能开考；同一副本同时只允许一场进行中）：
+--  - 管理员为副本指定一名学员与按顺序完成的进路目标，开考时刻固定目标与起始状态；
+--  - 只统计开考后归属该学员的【新进路实例】（id 大于开考时实例水位 start_instance_watermark）；
+--  - 目标实例成功开放、通过逐段走行正常解除时推进（等待申请自动兑现与定时走行同样计入）；
+--  - 顺序外的成功开放记为偏差；幂等重传不重复计数，人工释放/延时取消不算完成；
+--  - active 进行中 / submitted 学员已交卷（成绩保留，可继续查询）/
+--    terminated 被检查点回退或站场重置终止（已交卷成绩不受影响、不会进入本状态）。
+-- 有效用时冻结在本表：run_started_at 为当前一段"运行中计时"的起点；暂停时把本段
+-- 时长并入 active_elapsed_ms 并清空 run_started_at，恢复时重设起点，因此副本暂停
+-- 期间有效用时自动冻结；交卷/终止时把已累计时长固化到 final_elapsed_ms。
+CREATE TABLE IF NOT EXISTS exams (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  student       TEXT NOT NULL,             -- 被考核学员（值班员姓名）
+  status        TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active','submitted','terminated')),
+  started_by    TEXT NOT NULL,             -- 开考人（管理员）
+  started_at    INTEGER NOT NULL,          -- 开考时刻（epoch 毫秒）
+  -- 开考时已存在的最大进路实例编号；仅统计编号更大的开考后新实例（-1 表示当时无实例）
+  start_instance_watermark INTEGER NOT NULL DEFAULT -1,
+  active_elapsed_ms INTEGER NOT NULL DEFAULT 0, -- 已冻结的累计运行时长（暂停期间不增长）
+  run_started_at   INTEGER,                -- 当前运行段起点（暂停/交卷/终止时为 NULL）
+  submitted_at  INTEGER,                  -- 交卷时刻（epoch 毫秒）
+  final_elapsed_ms INTEGER,                -- 交卷/终止时固化的有效用时（毫秒）
+  terminated_reason TEXT,                  -- 终止说明（检查点回退/站场重置）
+  ended_at      INTEGER,                  -- 进入 submitted/terminated 的时刻（epoch 毫秒）
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 同一副本同时至多一场进行中（active）考核（重复开考由本部分唯一索引兜底拒绝）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_exam_active_once ON exams(status) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_exam_student ON exams(student);
+CREATE INDEX IF NOT EXISTS idx_exam_status ON exams(status, id);
+
+-- 考核进路目标（开考时固定顺序；仅统计与当前待达成目标相符的实例完成）：
+--  - goal_order 从 1 起；pending 待达成 / completed 已按序达成；
+--  - 顺序外成功开放的进路即使后来成为当前目标也不补算（完成的实例必须在其开放时
+--    正好对应当前待达成目标，才会写 instance_id/完成时刻）。
+CREATE TABLE IF NOT EXISTS exam_targets (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  exam_id      INTEGER NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+  goal_order   INTEGER NOT NULL,
+  route_id     TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending'
+               CHECK (status IN ('pending','completed')),
+  instance_id  INTEGER,                   -- 达成该目标的进路实例编号
+  completed_at INTEGER,                   -- 达成时刻（末段清空、进路正常解除；epoch 毫秒）
+  UNIQUE (exam_id, goal_order)
+);
+CREATE INDEX IF NOT EXISTS idx_exam_targets_status ON exam_targets(exam_id, status, goal_order);
+-- 同一进路实例至多被记为一个目标的达成（幂等/不重复计数的最后防线）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_exam_targets_instance
+  ON exam_targets(instance_id) WHERE instance_id IS NOT NULL;
+
+-- 考核偏差：学员在顺序外成功开放的进路实例（每实例至多一条，部分唯一索引兜底）。
+-- 偏差实例之后即便正常走行完成也不补算目标。
+CREATE TABLE IF NOT EXISTS exam_deviations (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  exam_id     INTEGER NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+  instance_id INTEGER NOT NULL,
+  route_id    TEXT NOT NULL,
+  goal_order  INTEGER,                    -- 开放时的当前待达成目标序号（展示用；无待达成目标为 NULL）
+  reason      TEXT NOT NULL,
+  created_at  INTEGER NOT NULL            -- 偏差记录时刻（= 成功开放时刻，epoch 毫秒）
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_exam_deviation_instance
+  ON exam_deviations(instance_id);
+CREATE INDEX IF NOT EXISTS idx_exam_deviation_exam ON exam_deviations(exam_id, id);
+
 CREATE INDEX IF NOT EXISTS idx_locks_instance ON route_locks(instance_id);
 CREATE INDEX IF NOT EXISTS idx_events_instance ON section_events(instance_id, seq);
 CREATE INDEX IF NOT EXISTS idx_steps_route ON route_steps(route_id, step_order);

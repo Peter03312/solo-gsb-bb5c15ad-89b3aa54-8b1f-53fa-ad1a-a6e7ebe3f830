@@ -189,13 +189,8 @@ function openRoute(routeId, switchPositions, clientName) {
 }
 
 /**
- * 开放进路（事务体）：定义校验→区段占用/锁定校验→道岔选择/实际/锁定校验
- * →写实例→写全部区段/道岔锁→入口信号转绿。任何一步失败 throw，由外层事务
- * （或等待兑现扫描中的 SAVEPOINT）整体回滚，不留下部分锁定。
- *
- * 直接开放时由 openRoute 包一层顶层事务；等待申请兑现扫描时，本函数在
- * 扫描事务内的 SAVEPOINT 中执行，失败只回滚本次兑现尝试。
- * @returns {number} 新建立的进路实例编号
+ * 开放进路并返回新实例编号（供等待兑现扫描在扫描事务内调用）。
+ * 与 openRoute 相同的校验+锁闭事务体；考核开放记账钩子也在同一事务内。
  */
 function openRouteInTxn(routeId, switchPositions, clientName) {
   const db = getDb();
@@ -288,6 +283,11 @@ function openRouteInTxn(routeId, switchPositions, clientName) {
     }
     throw e;
   }
+
+  // 考核记账（同一事务）：成功开放后判定该实例是否占住当前待达成目标，
+  // 顺序外开放记为偏差；只作用于"进行中考核、归属学员、开考后新实例"。
+  // 记账失败随事务回滚，不改变联锁主流程的判定结果。
+  require('./assessment').onInstanceOpenedInTxn(instanceId);
 
   return instanceId;
 }
@@ -489,6 +489,9 @@ function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName,
        WHERE id=?`
     ).run(instanceId);
     db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(instanceId);
+    // 考核记账（同一事务）：逐段走行正常解除——若该实例占住着当前考核目标，
+    // 在此推进（等待自动兑现开放、人工/定时走行完成都经此路径，故均计入）。
+    require('./assessment').onInstanceNormalReleasedInTxn(instanceId);
     return { idempotent: false, instanceId, seq, sectionId, action, routeReleased: true };
   }
 
@@ -524,6 +527,9 @@ function releaseInstance(instanceId, clientName) {
       `UPDATE route_instances SET status='released', released_at=datetime('now') WHERE id=?`
     ).run(instanceId);
     db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(instanceId);
+    // 考核记账（同一事务）：人工/兜底解除不算"逐段走行正常解除"——占住目标
+    // 的实例退回未占住，可重新排路完成；不推进目标、不记完成。
+    require('./assessment').onInstanceAbnormalReleasedInTxn(instanceId);
     // 人工/兜底解除：同事务停止活动定时走行计划（人工结果保留，不覆盖）
     require('./movement-plan').abortActiveByManualInTxn(
       instanceId, '进路被人工解除，定时走行计划停止；人工结果保留');
@@ -610,7 +616,9 @@ function getState() {
     handovers: require('./handover').listHandovers(),
     // 定时走行计划：全部计划（值班台查看/终止）+ 活动计划按实例索引
     movementPlans: require('./movement-plan').listPlans(),
-    activeMovementPlans: require('./movement-plan').activeByInstance()
+    activeMovementPlans: require('./movement-plan').activeByInstance(),
+    // 学员考核：进行中考核（管理台与值班台显示进度）；成绩列表走 /exams 接口
+    activeExam: require('./assessment').getActiveExam()
   };
 }
 

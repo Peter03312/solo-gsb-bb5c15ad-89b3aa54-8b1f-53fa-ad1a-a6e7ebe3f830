@@ -9,6 +9,7 @@ const blockade = require('../blockade');
 const handover = require('../handover');
 const movementPlan = require('../movement-plan');
 const pause = require('../pause');
+const assessment = require('../assessment');
 const { InterlockError } = require('../interlocking');
 
 const router = express.Router();
@@ -249,6 +250,41 @@ router.post('/handovers/:id/sign', wrap((req, res) => {
     repeated: result.repeated,
     handover: result.handover
   });
+}));
+
+/* ------------------------------ 学员考核 ------------------------------ */
+
+// 学员查看分配给自己的考核（进行中在前；含逐项目标、偏差与有效用时）。
+// ?scope=all 可查看本副本全部考核（值班台仲裁展示）；
+// 可选 ?status=active|submitted|terminated。
+router.get('/exams', wrap((req, res) => {
+  const scope = String(req.query.scope || 'mine');
+  const status = ['active', 'submitted', 'terminated'].includes(req.query.status)
+    ? req.query.status : null;
+  const exams = assessment.listExams({
+    student: scope === 'all' ? undefined : req.session.name,
+    status
+  });
+  res.json({ ok: true, exams, me: req.session.name });
+}));
+
+// 学员查看单场考核（本人或管理员均可；非本人拒绝）
+router.get('/exams/:id', wrap((req, res) => {
+  const exam = assessment.getExam(Number(req.params.id));
+  if (!exam) throw new InterlockError(404, 'EXAM_NOT_FOUND',
+    `考核 ${req.params.id} 不存在（或不属于当前副本）`);
+  if (exam.student !== req.session.name) {
+    throw new InterlockError(403, 'EXAM_NOT_ASSIGNED_STUDENT',
+      `不能查看：考核 #${exam.id} 指定的学员为 ${exam.student}，不是当前值班员 ${req.session.name}`);
+  }
+  res.json({ ok: true, exam, me: req.session.name });
+}));
+
+// 学员交卷：冻结有效用时，返回逐项目标状态、偏差与有效用时。
+// 非指定学员、已终止考核拒绝；已交卷重复交卷幂等返回原成绩。
+router.post('/exams/:id/submit', wrap((req, res) => {
+  const exam = assessment.submitExam(Number(req.params.id), req.session.name);
+  res.json({ ok: true, exam });
 }));
 
 module.exports = router;

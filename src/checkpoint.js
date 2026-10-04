@@ -255,7 +255,12 @@ function rollbackToCheckpoint(yardId, checkpointId, operator) {
       checkpointRollback: true
     })).changes;
 
-    return { row, shiftMs, expired };
+    // 6) 考核表不参与快照替换（考核在检查点特性之后引入）：回退终止进行中考核并
+    //    记录原因；已交卷成绩保留（submitted 不动）。
+    const examTerminated = require('./assessment').terminateActiveBySystemInTxn(
+      `管理员将副本回退到检查点 #${row.id}「${row.name}」，进行中考核终止；已交卷成绩保留`);
+
+    return { row, shiftMs, expired, examTerminated };
   })();
 
   return {
@@ -264,6 +269,7 @@ function rollbackToCheckpoint(yardId, checkpointId, operator) {
     restored: safeParse(result.row.summary, {}),
     timeShiftMs: result.shiftMs,
     handoversExpired: result.expired,
+    examTerminated: result.examTerminated,
     note: '副本已整体回退到检查点并保持暂停；检查点保留可再次使用，恢复副本后按现有规则继续运行'
   };
 }
